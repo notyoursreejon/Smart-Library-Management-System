@@ -1,6 +1,6 @@
 require('dotenv').config();
 const bcrypt = require('bcryptjs');
-const { connectDatabase } = require('./src/config/database');
+const connectDB = require('./src/config/db');
 const User = require('./src/models/User');
 const Book = require('./src/models/Book');
 const Issue = require('./src/models/Issue');
@@ -8,7 +8,7 @@ const Reservation = require('./src/models/Reservation');
 const Fine = require('./src/models/Fine');
 
 async function seed() {
-  await connectDatabase();
+  await connectDB();
   console.log('🌱 Seeding database...\n');
 
   // Clear existing data
