@@ -1,114 +1,110 @@
 const express = require('express');
-const { getOne, getAll, runQuery } = require('../config/database');
+const Book = require('../models/Book');
+const User = require('../models/User');
+const Issue = require('../models/Issue');
+const Reservation = require('../models/Reservation');
+const Fine = require('../models/Fine');
 const { authenticate, authorize } = require('../middleware/auth');
 
 const router = express.Router();
 
-// GET /api/dashboard/stats
-router.get('/stats', authenticate, (req, res) => {
-  // Auto-update overdue
-  runQuery("UPDATE issues SET status='overdue' WHERE status='issued' AND due_date < datetime('now')");
+router.get('/stats', authenticate, async (req, res) => {
+  try {
+    await Issue.updateMany({ status: 'issued', due_date: { $lt: new Date() } }, { status: 'overdue' });
 
-  const totalBooks = getOne('SELECT COUNT(*) as count FROM books');
-  const totalCopies = getOne('SELECT COALESCE(SUM(total_copies),0) as count FROM books');
-  const availableCopies = getOne('SELECT COALESCE(SUM(available_copies),0) as count FROM books');
-  const issuedBooks = getOne("SELECT COUNT(*) as count FROM issues WHERE status IN ('issued','overdue')");
-  const overdueBooks = getOne("SELECT COUNT(*) as count FROM issues WHERE status='overdue'");
-  const totalUsers = getOne('SELECT COUNT(*) as count FROM users');
-  const activeStudents = getOne("SELECT COUNT(*) as count FROM users WHERE role='student'");
-  const pendingReservations = getOne("SELECT COUNT(*) as count FROM reservations WHERE status='pending'");
-  const totalFinesUnpaid = getOne('SELECT COALESCE(SUM(amount),0) as total FROM fines WHERE paid=0');
-  const totalFinesCollected = getOne('SELECT COALESCE(SUM(amount),0) as total FROM fines WHERE paid=1');
+    const [totalBooks, totalCopies, availableCopies, issuedBooks, overdueBooks, totalUsers, activeStudents, pendingReservations, unpaidAgg, collectedAgg] = await Promise.all([
+      Book.countDocuments(),
+      Book.aggregate([{ $group: { _id: null, t: { $sum: '$total_copies' } } }]),
+      Book.aggregate([{ $group: { _id: null, t: { $sum: '$available_copies' } } }]),
+      Issue.countDocuments({ status: { $in: ['issued', 'overdue'] } }),
+      Issue.countDocuments({ status: 'overdue' }),
+      User.countDocuments(),
+      User.countDocuments({ role: 'student' }),
+      Reservation.countDocuments({ status: 'pending' }),
+      Fine.aggregate([{ $match: { paid: false } }, { $group: { _id: null, t: { $sum: '$amount' } } }]),
+      Fine.aggregate([{ $match: { paid: true } }, { $group: { _id: null, t: { $sum: '$amount' } } }]),
+    ]);
 
-  res.json({
-    stats: {
-      totalBooks: totalBooks.count,
-      totalCopies: totalCopies.count,
-      availableCopies: availableCopies.count,
-      issuedBooks: issuedBooks.count,
-      overdueBooks: overdueBooks.count,
-      totalUsers: totalUsers.count,
-      activeStudents: activeStudents.count,
-      pendingReservations: pendingReservations.count,
-      totalFinesUnpaid: Math.round((totalFinesUnpaid.total || 0) * 100) / 100,
-      totalFinesCollected: Math.round((totalFinesCollected.total || 0) * 100) / 100
-    }
-  });
+    res.json({ stats: {
+      totalBooks, totalCopies: totalCopies[0]?.t || 0, availableCopies: availableCopies[0]?.t || 0,
+      issuedBooks, overdueBooks, totalUsers, activeStudents, pendingReservations,
+      totalFinesUnpaid: Math.round((unpaidAgg[0]?.t || 0) * 100) / 100,
+      totalFinesCollected: Math.round((collectedAgg[0]?.t || 0) * 100) / 100,
+    }});
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch stats.' }); }
 });
 
-// GET /api/dashboard/reports
-router.get('/reports', authenticate, authorize('admin', 'librarian'), (req, res) => {
-  const monthlyIssues = getAll(`
-    SELECT strftime('%Y-%m', issue_date) as month, COUNT(*) as count
-    FROM issues WHERE issue_date >= date('now','-6 months')
-    GROUP BY month ORDER BY month ASC
-  `);
+router.get('/reports', authenticate, authorize('admin', 'librarian'), async (req, res) => {
+  try {
+    const sixMonthsAgo = new Date(); sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
 
-  const issuesByCategory = getAll(`
-    SELECT b.category, COUNT(*) as count FROM issues i JOIN books b ON i.book_id=b.id
-    GROUP BY b.category ORDER BY count DESC LIMIT 10
-  `);
+    const [monthlyIssues, issuesByCategory, popularBooks, recentActivity, monthlyFines, usersByRole] = await Promise.all([
+      Issue.aggregate([
+        { $match: { issue_date: { $gte: sixMonthsAgo } } },
+        { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$issue_date' } }, count: { $sum: 1 } } },
+        { $sort: { _id: 1 } }, { $project: { month: '$_id', count: 1, _id: 0 } }
+      ]),
+      Issue.aggregate([
+        { $lookup: { from: 'books', localField: 'book_id', foreignField: '_id', as: 'book' } },
+        { $unwind: '$book' },
+        { $group: { _id: '$book.category', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }, { $limit: 10 },
+        { $project: { category: '$_id', count: 1, _id: 0 } }
+      ]),
+      Book.aggregate([
+        { $lookup: { from: 'issues', localField: '_id', foreignField: 'book_id', as: 'issues' } },
+        { $project: { title: 1, author: 1, issue_count: { $size: '$issues' } } },
+        { $sort: { issue_count: -1 } }, { $limit: 10 }
+      ]),
+      Issue.find().populate('book_id', 'title').populate('user_id', 'name')
+        .sort({ createdAt: -1 }).limit(20).lean()
+        .then(items => items.map(i => ({ id: i._id, status: i.status, issue_date: i.issue_date, return_date: i.return_date, book_title: i.book_id?.title, user_name: i.user_id?.name }))),
+      Fine.aggregate([
+        { $match: { createdAt: { $gte: sixMonthsAgo } } },
+        { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$createdAt' } }, total: { $sum: '$amount' }, collected: { $sum: { $cond: ['$paid', '$amount', 0] } } } },
+        { $sort: { _id: 1 } }, { $project: { month: '$_id', total: 1, collected: 1, _id: 0 } }
+      ]),
+      User.aggregate([{ $group: { _id: '$role', count: { $sum: 1 } } }, { $project: { role: '$_id', count: 1, _id: 0 } }]),
+    ]);
 
-  const popularBooks = getAll(`
-    SELECT b.title, b.author, COUNT(i.id) as issue_count
-    FROM books b LEFT JOIN issues i ON b.id=i.book_id
-    GROUP BY b.id ORDER BY issue_count DESC LIMIT 10
-  `);
-
-  const recentActivity = getAll(`
-    SELECT i.id, i.status, i.issue_date, i.return_date, b.title as book_title, u.name as user_name
-    FROM issues i JOIN books b ON i.book_id=b.id JOIN users u ON i.user_id=u.id
-    ORDER BY i.created_at DESC LIMIT 20
-  `);
-
-  const monthlyFines = getAll(`
-    SELECT strftime('%Y-%m', created_at) as month,
-           SUM(amount) as total, SUM(CASE WHEN paid=1 THEN amount ELSE 0 END) as collected
-    FROM fines WHERE created_at >= date('now','-6 months')
-    GROUP BY month ORDER BY month ASC
-  `);
-
-  const usersByRole = getAll('SELECT role, COUNT(*) as count FROM users GROUP BY role');
-
-  res.json({ reports: { monthlyIssues, issuesByCategory, popularBooks, recentActivity, monthlyFines, usersByRole } });
+    res.json({ reports: { monthlyIssues, issuesByCategory, popularBooks, recentActivity, monthlyFines, usersByRole } });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch reports.' }); }
 });
 
-// GET /api/dashboard/users
-router.get('/users', authenticate, authorize('admin'), (req, res) => {
-  const users = getAll('SELECT id,name,email,role,avatar_color,created_at FROM users ORDER BY created_at DESC');
-  res.json({ users });
+router.get('/users', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const users = await User.find().select('name email role avatar_color createdAt').sort({ createdAt: -1 }).lean();
+    res.json({ users: users.map(u => ({ id: u._id, name: u.name, email: u.email, role: u.role, avatar_color: u.avatar_color, created_at: u.createdAt })) });
+  } catch (err) { res.status(500).json({ error: 'Failed to fetch users.' }); }
 });
 
-// PUT /api/dashboard/users/:id/role
-router.put('/users/:id/role', authenticate, authorize('admin'), (req, res) => {
-  const { role } = req.body;
-  if (!['student', 'librarian', 'admin'].includes(role)) return res.status(400).json({ error: 'Invalid role.' });
-
-  const user = getOne('SELECT id FROM users WHERE id=?', [req.params.id]);
-  if (!user) return res.status(404).json({ error: 'User not found.' });
-  if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot change your own role.' });
-
-  runQuery("UPDATE users SET role=?, updated_at=datetime('now') WHERE id=?", [role, req.params.id]);
-  const updated = getOne('SELECT id,name,email,role,avatar_color,created_at FROM users WHERE id=?', [req.params.id]);
-  res.json({ user: updated });
+router.put('/users/:id/role', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const { role } = req.body;
+    if (!['student', 'librarian', 'admin'].includes(role)) return res.status(400).json({ error: 'Invalid role.' });
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found.' });
+    if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot change your own role.' });
+    user.role = role; await user.save();
+    res.json({ user: { id: user._id, name: user.name, email: user.email, role: user.role, avatar_color: user.avatar_color, created_at: user.createdAt } });
+  } catch (err) { res.status(500).json({ error: 'Failed to update role.' }); }
 });
 
-// DELETE /api/dashboard/users/:id
-router.delete('/users/:id', authenticate, authorize('admin'), (req, res) => {
-  if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete your own account.' });
-
-  const user = getOne('SELECT id FROM users WHERE id=?', [req.params.id]);
-  if (!user) return res.status(404).json({ error: 'User not found.' });
-
-  const active = getOne("SELECT COUNT(*) as count FROM issues WHERE user_id=? AND status='issued'", [req.params.id]);
-  if (active && active.count > 0) return res.status(400).json({ error: 'Cannot delete user with active issues.' });
-
-  runQuery('DELETE FROM reservations WHERE user_id=?', [req.params.id]);
-  runQuery('DELETE FROM fines WHERE user_id=?', [req.params.id]);
-  runQuery('DELETE FROM issues WHERE user_id=?', [req.params.id]);
-  runQuery('DELETE FROM users WHERE id=?', [req.params.id]);
-
-  res.json({ message: 'User deleted successfully.' });
+router.delete('/users/:id', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot delete your own account.' });
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found.' });
+    const active = await Issue.countDocuments({ user_id: req.params.id, status: 'issued' });
+    if (active > 0) return res.status(400).json({ error: 'Cannot delete user with active issues.' });
+    await Promise.all([
+      Reservation.deleteMany({ user_id: req.params.id }),
+      Fine.deleteMany({ user_id: req.params.id }),
+      Issue.deleteMany({ user_id: req.params.id }),
+      User.findByIdAndDelete(req.params.id),
+    ]);
+    res.json({ message: 'User deleted successfully.' });
+  } catch (err) { res.status(500).json({ error: 'Failed to delete user.' }); }
 });
 
 module.exports = router;

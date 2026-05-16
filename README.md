@@ -7,9 +7,14 @@ A full-stack library management system with a premium dark-themed UI.
 | Layer | Technology |
 |-------|-----------|
 | Frontend | React 18, Vite, React Router, Recharts, Lucide Icons |
-| Backend | Node.js, Express.js, JWT Auth |
-| Database | SQLite (via sql.js — zero config) |
+| Backend | Node.js, Express.js, Mongoose, JWT Auth |
+| Database | MongoDB (local or Atlas) |
 | Styling | Vanilla CSS with Glassmorphism design |
+
+## Prerequisites
+
+- **Node.js** 18+
+- **MongoDB** — [Install locally](https://www.mongodb.com/docs/manual/installation/) or use [MongoDB Atlas](https://www.mongodb.com/atlas) (free tier)
 
 ## Quick Start
 
@@ -18,9 +23,11 @@ A full-stack library management system with a premium dark-themed UI.
 ```bash
 cd backend
 npm install
-node seed.js       # Seeds database with sample data
+node seed.js       # Seeds MongoDB with sample data
 node src/app.js    # Starts API on http://localhost:5000
 ```
+
+> **MongoDB Atlas?** Set `MONGO_URI` in `backend/.env` to your Atlas connection string.
 
 ### 2. Frontend (new terminal)
 
@@ -79,6 +86,7 @@ npm run dev        # Starts UI on http://localhost:5173
 ├── backend/
 │   ├── src/
 │   │   ├── config/database.js
+│   │   ├── models/User, Book, Issue, Reservation, Fine
 │   │   ├── middleware/auth.js, errorHandler.js
 │   │   ├── routes/auth, books, issues, reservations, fines, dashboard
 │   │   └── app.js
